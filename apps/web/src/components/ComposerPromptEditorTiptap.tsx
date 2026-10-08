@@ -1,3 +1,9 @@
+import {
+  bulletToTaskInputRule,
+  composerCodeFenceInputRule,
+  exitComposerQuote,
+  listMarkerInputRule,
+} from "../composer-block-input";
 import { Extension, InputRule, Node, wrappingInputRule, type JSONContent } from "@tiptap/core";
 import { ReactNodeViewRenderer, NodeViewWrapper, type NodeViewProps } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -57,7 +63,6 @@ import {
   buildTiptapContent,
   collapsedToFlat,
   caretTakesMarksBefore,
-  convertBulletItemToTask,
   ComposerCodeExtension,
   ComposerTaskItemExtension,
   ComposerTaskListExtension,
@@ -551,65 +556,6 @@ function collectStyledRanges(doc: ProseMirrorNode): StyledRange[] {
   return ranges;
 }
 
-/**
- * A typed marker becomes a list item that remembers the marker it was typed
- * with, so the stored Markdown keeps `*` or `3)` rather than a canonical `-`.
- *
- * `- ` alone is not enough for a dash: it waits for the first character after
- * the space, which it carries into the new item. That is what lets the GFM
- * task gesture `- [ ] ` or `- [x] ` be typed whole and reach the task rule,
- * instead of being cut off by an instant bullet. A `- ` left on its own is
- * still a bullet the next time the draft is rebuilt.
- */
-function listMarkerInputRule(find: RegExp, listType: "bulletList" | "orderedList"): InputRule {
-  return new InputRule({
-    find,
-    handler: ({ state, range, match, chain }) => {
-      const marker = match.groups?.marker ?? "-";
-      const space = match.groups?.space ?? " ";
-      const carried = match.groups?.carried ?? "";
-      // Top-level paragraphs only: inside an item or a quote the new list
-      // would nest under a line the stored draft writes flat.
-      const $from = state.doc.resolve(range.from);
-      if ($from.parent.type.name !== "paragraph" || $from.depth !== 1) return null;
-      const command = chain()
-        .deleteRange(range)
-        .wrapInList(
-          listType,
-          listType === "orderedList" ? { start: Number.parseInt(marker, 10) || 1 } : {},
-        )
-        .updateAttributes("listItem", { marker, space });
-      (carried ? command.insertContent(carried) : command).run();
-      return undefined;
-    },
-  });
-}
-
-/**
- * `[ ] ` at the start of an existing bullet item turns it into a task, for
- * items that were already a list when the checkbox was wanted. New tasks are
- * typed whole, `- [ ] `, and reach the task rule directly.
- */
-const bulletToTaskInputRule = new InputRule({
-  find: /^\[([ xX])\] $/,
-  handler: ({ state, range, match, chain }) => {
-    const $from = state.doc.resolve(range.from);
-    const item = $from.node(-1);
-    if ($from.parent.type.name !== "paragraph" || item?.type.name !== "listItem") return null;
-    // Any bullet converts; the task grammar only knows `-`, so a `*` or `+`
-    // item comes back out as `- [ ]`.
-    if (!["-", "*", "+"].includes((item.attrs as { marker?: string }).marker ?? "")) return null;
-    const checked = (match[1] ?? " ").toLowerCase() === "x";
-    chain()
-      .command(({ tr }) => {
-        convertBulletItemToTask(tr, range.from, range.to, checked);
-        return true;
-      })
-      .run();
-    return undefined;
-  },
-});
-
 /** `- [ ] ` or `- [x] ` at a top-level paragraph, for the same reason as the list markers. */
 function taskInputRule(type: NodeType): InputRule {
   const rule = wrappingInputRule({
@@ -1040,11 +986,9 @@ function ComposerPromptEditorTiptapInner(props: ComposerPromptEditorProps) {
                       event.target.closest(".chat-markdown-codeblock-header") !== null,
                   });
                 },
-                // Tiptap's own ``` + space rule would open a fence inside a
-                // list item or quote, where the serializer has no line for
-                // it. Enter on a fence line covers the gesture at top level.
+                // Only top-level fences can be written by the serializer.
                 addInputRules() {
-                  return [];
+                  return [composerCodeFenceInputRule];
                 },
               }),
               composerCodeBlockHighlight({
@@ -1080,13 +1024,7 @@ function ComposerPromptEditorTiptapInner(props: ComposerPromptEditorProps) {
                   : extension.extend({
                       addInputRules() {
                         return this.name === "bulletList"
-                          ? [
-                              listMarkerInputRule(/^(?<marker>[*+])(?<space>\s)$/, "bulletList"),
-                              listMarkerInputRule(
-                                /^(?<marker>-)(?<space>[ \t]+)(?<carried>[^\s[])$/,
-                                "bulletList",
-                              ),
-                            ]
+                          ? [listMarkerInputRule(/^(?<marker>[-*+])(?<space>\s)$/, "bulletList")]
                           : [
                               listMarkerInputRule(
                                 /^(?<marker>\d+[.)])(?<space>\s)$/,
@@ -1294,13 +1232,7 @@ function ComposerPromptEditorTiptapInner(props: ComposerPromptEditorProps) {
             if ((isTaskItem || isListItem) && instance && splitOrLiftListItem(instance)) {
               return true;
             }
-            if (
-              richText &&
-              instance &&
-              hasAncestor(view.state.selection.$from, "blockquote") &&
-              view.state.selection.$from.parent.content.size === 0 &&
-              instance.commands.lift("blockquote")
-            ) {
+            if (richText && instance && event.shiftKey && exitComposerQuote(instance)) {
               return true;
             }
             // Split the paragraph so a single newline visibly advances the caret.
